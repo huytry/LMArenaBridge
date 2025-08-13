@@ -19,6 +19,21 @@
     let socket;
     let isCaptureModeActive = false; // ID捕获模式的开关
 
+    // 每个标签页的独立客户端ID（会随标签页生命周期变化）
+    const CLIENT_ID_KEY = 'LMArenaApiBridge_ClientId';
+    const CLIENT_ID = (() => {
+        try {
+            let id = sessionStorage.getItem(CLIENT_ID_KEY);
+            if (!id) {
+                id = (crypto && crypto.randomUUID) ? crypto.randomUUID() : (Date.now() + '-' + Math.random().toString(16).slice(2));
+                sessionStorage.setItem(CLIENT_ID_KEY, id);
+            }
+            return id;
+        } catch (e) {
+            return (Date.now() + '-' + Math.random().toString(16).slice(2));
+        }
+    })();
+
     // --- 核心逻辑 ---
     function connect() {
         console.log(`[API Bridge] 正在连接到本地服务器: ${SERVER_URL}...`);
@@ -27,6 +42,11 @@
         socket.onopen = () => {
             console.log("[API Bridge] ✅ 与本地服务器的 WebSocket 连接已建立。");
             document.title = "✅ " + document.title;
+            // 向服务器注册当前客户端
+            try {
+                const meta = { title: document.title, url: location.href };
+                socket.send(JSON.stringify({ type: 'register', client_id: CLIENT_ID, meta }));
+            } catch (e) {}
         };
 
         socket.onmessage = async (event) => {
@@ -78,6 +98,28 @@
             console.error("[API Bridge] ❌ WebSocket 发生错误:", error);
             socket.close(); // 会触发 onclose 中的重连逻辑
         };
+
+        // 心跳：每 15 秒发送一次 ping 以维持活跃与更新 last_seen
+        const pingInterval = 15000;
+        const timer = setInterval(() => {
+            if (!socket || socket.readyState !== WebSocket.OPEN) {
+                clearInterval(timer);
+                return;
+            }
+            try {
+                socket.send(JSON.stringify({ type: 'ping', client_id: CLIENT_ID }));
+            } catch (e) {}
+        }, pingInterval);
+
+        // 当页面可见性变化或标题变化时，刷新一次元信息
+        document.addEventListener('visibilitychange', () => {
+            if (socket && socket.readyState === WebSocket.OPEN) {
+                try {
+                    const meta = { title: document.title, url: location.href, visibility: document.visibilityState };
+                    socket.send(JSON.stringify({ type: 'register', client_id: CLIENT_ID, meta }));
+                } catch (e) {}
+            }
+        });
     }
 
     async function executeFetchAndStreamBack(requestId, payload) {
@@ -192,7 +234,8 @@
         if (socket && socket.readyState === WebSocket.OPEN) {
             const message = {
                 request_id: requestId,
-                data: data
+                data: data,
+                client_id: CLIENT_ID,
             };
             socket.send(JSON.stringify(message));
         } else {
@@ -232,6 +275,14 @@
                 }
 
                 // 异步将捕获到的ID发送到本地的 id_updater.py 脚本
+                // 发送给本地 API 服务器（用于仪表盘/自动保存默认会话）
+                fetch('http://localhost:5102/internal/update_session_ids', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ sessionId, messageId, clientId: CLIENT_ID })
+                }).catch(() => {});
+
+                // 同时兼容旧的 id_updater.py 流程
                 fetch('http://127.0.0.1:5103/update', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },

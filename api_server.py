@@ -21,7 +21,8 @@ import requests
 from packaging.version import parse as parse_version
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse, JSONResponse, Response
+from fastapi.responses import StreamingResponse, JSONResponse, Response, HTMLResponse
+from typing import Any, Dict
 
 # --- 导入自定义模块 ---
 from modules import image_generation
@@ -32,13 +33,15 @@ logger = logging.getLogger(__name__)
 
 # --- 全局状态与配置 ---
 CONFIG = {} # 存储从 config.jsonc 加载的配置
-# browser_ws 用于存储与单个油猴脚本的 WebSocket 连接。
-# 注意：此架构假定只有一个浏览器标签页在工作。
-# 如果需要支持多个并发标签页，需要将此扩展为字典管理多个连接。
-browser_ws: WebSocket | None = None
-# response_channels 用于存储每个 API 请求的响应队列。
-# 键是 request_id，值是 asyncio.Queue。
+# 支持多个浏览器客户端的 WebSocket 连接
+# 键: client_id, 值: {'ws': WebSocket, 'meta': dict, 'connected_at': datetime, 'last_seen': datetime}
+browser_clients: dict[str, dict] = {}
+# 反向映射：WebSocket -> client_id
+ws_to_client_id: dict[Any, str] = {}
+# 每个 API 请求的响应队列。键是 request_id，值是 asyncio.Queue。
 response_channels: dict[str, asyncio.Queue] = {}
+# 每个请求ID对应的所属客户端
+request_owner_client: dict[str, str] = {}
 last_activity_time = None # 记录最后一次活动的时间
 idle_monitor_thread = None # 空闲监控线程
 main_event_loop = None # 主事件循环
@@ -66,6 +69,16 @@ def load_model_endpoint_map():
     except json.JSONDecodeError as e:
         logger.error(f"加载或解析 'model_endpoint_map.json' 失败: {e}。将使用空映射。")
         MODEL_ENDPOINT_MAP = {}
+
+
+def save_model_endpoint_map():
+    """将内存中的 MODEL_ENDPOINT_MAP 保存回 model_endpoint_map.json。"""
+    try:
+        with open('model_endpoint_map.json', 'w', encoding='utf-8') as f:
+            json.dump(MODEL_ENDPOINT_MAP, f, indent=2, ensure_ascii=False)
+        logger.info("✅ 成功将模型端点映射写入 'model_endpoint_map.json'。")
+    except Exception as e:
+        logger.error(f"❌ 写入 'model_endpoint_map.json' 时发生错误: {e}")
 
 def load_config():
     """从 config.jsonc 加载配置，并处理 JSONC 注释。"""
@@ -255,17 +268,17 @@ def restart_server():
     
     # 1. (异步) 通知浏览器刷新
     async def notify_browser_refresh():
-        if browser_ws:
-            try:
-                # 优先发送 'reconnect' 指令，让前端知道这是一个计划内的重启
-                await browser_ws.send_text(json.dumps({"command": "reconnect"}, ensure_ascii=False))
-                logger.info("已向浏览器发送 'reconnect' 指令。")
-            except Exception as e:
-                logger.error(f"发送 'reconnect' 指令失败: {e}")
+        if browser_clients:
+            for cid, info in list(browser_clients.items()):
+                try:
+                    await info['ws'].send_text(json.dumps({"command": "reconnect"}, ensure_ascii=False))
+                    logger.info(f"已向浏览器客户端 {cid[:8]} 发送 'reconnect' 指令。")
+                except Exception as e:
+                    logger.error(f"发送 'reconnect' 指令到客户端 {cid[:8]} 失败: {e}")
     
     # 在主事件循环中运行异步通知函数
     # 使用`asyncio.run_coroutine_threadsafe`确保线程安全
-    if browser_ws and browser_ws.client_state.name == 'CONNECTED' and main_event_loop:
+    if browser_clients and main_event_loop:
         asyncio.run_coroutine_threadsafe(notify_browser_refresh(), main_event_loop)
     
     # 2. 延迟几秒以确保消息发送
@@ -630,10 +643,11 @@ async def _process_lmarena_stream(request_id: str):
                     # 2. 检查 Cloudflare 验证页面
                     if any(re.search(p, error_msg, re.IGNORECASE) for p in cloudflare_patterns):
                         friendly_error_msg = "检测到 Cloudflare 人机验证页面。请在浏览器中刷新 LMArena 页面并手动完成验证，然后重试请求。"
-                        if browser_ws:
+                        if browser_clients:
                             try:
-                                await browser_ws.send_text(json.dumps({"command": "refresh"}, ensure_ascii=False))
-                                logger.info(f"PROCESSOR [ID: {request_id[:8]}]: 在错误消息中检测到CF并已发送刷新指令。")
+                                for cid, info in list(browser_clients.items()):
+                                    await info['ws'].send_text(json.dumps({"command": "refresh"}, ensure_ascii=False))
+                                logger.info(f"PROCESSOR [ID: {request_id[:8]}]: 在错误消息中检测到CF并已向所有客户端发送刷新指令。")
                             except Exception as e:
                                 logger.error(f"PROCESSOR [ID: {request_id[:8]}]: 发送刷新指令失败: {e}")
                         yield 'error', friendly_error_msg
@@ -649,10 +663,11 @@ async def _process_lmarena_stream(request_id: str):
 
             if any(re.search(p, buffer, re.IGNORECASE) for p in cloudflare_patterns):
                 error_msg = "检测到 Cloudflare 人机验证页面。请在浏览器中刷新 LMArena 页面并手动完成验证，然后重试请求。"
-                if browser_ws:
+                if browser_clients:
                     try:
-                        await browser_ws.send_text(json.dumps({"command": "refresh"}, ensure_ascii=False))
-                        logger.info(f"PROCESSOR [ID: {request_id[:8]}]: 已向浏览器发送页面刷新指令。")
+                        for cid, info in list(browser_clients.items()):
+                            await info['ws'].send_text(json.dumps({"command": "refresh"}, ensure_ascii=False))
+                        logger.info(f"PROCESSOR [ID: {request_id[:8]}]: 已向所有客户端发送页面刷新指令。")
                     except Exception as e:
                         logger.error(f"PROCESSOR [ID: {request_id[:8]}]: 发送刷新指令失败: {e}")
                 yield 'error', error_msg
@@ -752,42 +767,82 @@ async def non_stream_response(request_id: str, model: str):
 # --- WebSocket 端点 ---
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
-    """处理来自油猴脚本的 WebSocket 连接。"""
-    global browser_ws
+    """处理来自油猴脚本的 WebSocket 连接 (支持多客户端)。"""
     await websocket.accept()
-    if browser_ws is not None:
-        logger.warning("检测到新的油猴脚本连接，旧的连接将被替换。")
-    logger.info("✅ 油猴脚本已成功连接 WebSocket。")
-    browser_ws = websocket
+    client_id_for_ws: str | None = None
+    logger.info("✅ 一个新的油猴脚本 WebSocket 连接已建立，等待注册信息...")
     try:
         while True:
             # 等待并接收来自油猴脚本的消息
             message_str = await websocket.receive_text()
             message = json.loads(message_str)
-            
-            request_id = message.get("request_id")
-            data = message.get("data")
 
-            if not request_id or data is None:
+            # 客户端注册报文: {"type":"register","client_id":"...","meta":{...}}
+            if isinstance(message, dict) and message.get("type") == "register":
+                client_id_for_ws = message.get("client_id") or str(uuid.uuid4())
+                meta = message.get("meta", {})
+                browser_clients[client_id_for_ws] = {
+                    'ws': websocket,
+                    'meta': meta,
+                    'connected_at': datetime.now(),
+                    'last_seen': datetime.now(),
+                }
+                ws_to_client_id[websocket] = client_id_for_ws
+                logger.info(f"✅ 已注册浏览器客户端: {client_id_for_ws[:8]} meta={meta}")
+                # 不把这个注册消息当做数据流，继续下一轮
+                continue
+
+            # 心跳报文: {"type":"ping","client_id":"..."}
+            if isinstance(message, dict) and message.get("type") == "ping":
+                cid = message.get("client_id") or ws_to_client_id.get(websocket)
+                if cid and cid in browser_clients:
+                    browser_clients[cid]['last_seen'] = datetime.now()
+                continue
+
+            # 普通数据流报文: {"request_id":"...","data":..., "client_id":"..."}
+            req_id = message.get("request_id")
+            data = message.get("data")
+            msg_cid = message.get("client_id")
+
+            # 更新 last_seen
+            resolved_cid = msg_cid or ws_to_client_id.get(websocket)
+            if resolved_cid and resolved_cid in browser_clients:
+                browser_clients[resolved_cid]['last_seen'] = datetime.now()
+                if not client_id_for_ws:
+                    client_id_for_ws = resolved_cid
+                    ws_to_client_id[websocket] = resolved_cid
+
+            if not req_id or data is None:
                 logger.warning(f"收到来自浏览器的无效消息: {message}")
                 continue
 
             # 将收到的数据放入对应的响应通道
-            if request_id in response_channels:
-                await response_channels[request_id].put(data)
+            if req_id in response_channels:
+                owner_cid = request_owner_client.get(req_id)
+                if owner_cid and resolved_cid and owner_cid != resolved_cid:
+                    logger.warning(f"⚠️ 非所属客户端 {resolved_cid[:8]} 尝试写入请求 {req_id[:8]} 的响应，已忽略。所属: {owner_cid[:8]}")
+                    continue
+                await response_channels[req_id].put(data)
             else:
-                logger.warning(f"⚠️ 收到未知或已关闭请求的响应: {request_id}")
+                logger.warning(f"⚠️ 收到未知或已关闭请求的响应: {req_id}")
 
     except WebSocketDisconnect:
         logger.warning("❌ 油猴脚本客户端已断开连接。")
     except Exception as e:
         logger.error(f"WebSocket 处理时发生未知错误: {e}", exc_info=True)
     finally:
-        browser_ws = None
-        # 清理所有等待的响应通道，以防请求被挂起
-        for queue in response_channels.values():
-            await queue.put({"error": "Browser disconnected during operation"})
-        response_channels.clear()
+        # 找到并移除该连接对应的客户端
+        disconnected_client_id = ws_to_client_id.pop(websocket, None)
+        if disconnected_client_id and disconnected_client_id in browser_clients:
+            del browser_clients[disconnected_client_id]
+            logger.info(f"客户端 {disconnected_client_id[:8]} 已从注册表移除。")
+        # 清理该客户端所有挂起的响应通道
+        to_cleanup = [rid for rid, cid in request_owner_client.items() if cid == disconnected_client_id]
+        for rid in to_cleanup:
+            if rid in response_channels:
+                await response_channels[rid].put({"error": "Browser disconnected during operation"})
+                del response_channels[rid]
+            del request_owner_client[rid]
         logger.info("WebSocket 连接已清理。")
 
 # --- OpenAI 兼容 API 端点 ---
@@ -819,15 +874,17 @@ async def request_model_update():
     接收来自 model_updater.py 的请求，并通过 WebSocket 指令
     让油猴脚本发送页面源码。
     """
-    if not browser_ws:
+    if not browser_clients:
         logger.warning("MODEL UPDATE: 收到更新请求，但没有浏览器连接。")
         raise HTTPException(status_code=503, detail="Browser client not connected.")
     
+    # 选择一个客户端执行
+    target_client_id = random.choice(list(browser_clients.keys()))
     try:
-        logger.info("MODEL UPDATE: 收到更新请求，正在通过 WebSocket 发送指令...")
-        await browser_ws.send_text(json.dumps({"command": "send_page_source"}))
+        logger.info(f"MODEL UPDATE: 收到更新请求，正在通过 WebSocket 发送指令到客户端 {target_client_id[:8]}...")
+        await browser_clients[target_client_id]['ws'].send_text(json.dumps({"command": "send_page_source"}))
         logger.info("MODEL UPDATE: 'send_page_source' 指令已成功发送。")
-        return JSONResponse({"status": "success", "message": "Request to send page source sent."})
+        return JSONResponse({"status": "success", "message": "Request to send page source sent.", "client_id": target_client_id})
     except Exception as e:
         logger.error(f"MODEL UPDATE: 发送指令时出错: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Failed to send command via WebSocket.")
@@ -888,8 +945,8 @@ async def chat_completions(request: Request):
                 detail="提供的 API Key 不正确。"
             )
 
-    if not browser_ws:
-        raise HTTPException(status_code=503, detail="油猴脚本客户端未连接。请确保 LMArena 页面已打开并激活脚本。")
+    if not browser_clients:
+        raise HTTPException(status_code=503, detail="油猴脚本客户端未连接。请确保至少有一个 LMArena 页面已打开并激活脚本。")
 
     try:
         openai_req = await request.json()
@@ -900,6 +957,7 @@ async def chat_completions(request: Request):
     model_name = openai_req.get("model")
     session_id, message_id = None, None
     mode_override, battle_target_override = None, None
+    preferred_client_id = None
 
     if model_name and model_name in MODEL_ENDPOINT_MAP:
         mapping_entry = MODEL_ENDPOINT_MAP[model_name]
@@ -918,12 +976,15 @@ async def chat_completions(request: Request):
             # 关键：同时获取模式信息
             mode_override = selected_mapping.get("mode") # 可能为 None
             battle_target_override = selected_mapping.get("battle_target") # 可能为 None
+            preferred_client_id = selected_mapping.get("client_id") # 可能为 None
             log_msg = f"将使用 Session ID: ...{session_id[-6:] if session_id else 'N/A'}"
             if mode_override:
                 log_msg += f" (模式: {mode_override}"
                 if mode_override == 'battle':
                     log_msg += f", 目标: {battle_target_override or 'A'}"
                 log_msg += ")"
+            if preferred_client_id:
+                log_msg += f" (客户端: {preferred_client_id[:8]})"
             logger.info(log_msg)
 
     # 如果经过以上处理，session_id 仍然是 None，则进入全局回退逻辑
@@ -955,6 +1016,14 @@ async def chat_completions(request: Request):
     response_channels[request_id] = asyncio.Queue()
     logger.info(f"API CALL [ID: {request_id[:8]}]: 已创建响应通道。")
 
+    # 选择一个浏览器客户端
+    if preferred_client_id and preferred_client_id in browser_clients:
+        target_client_id = preferred_client_id
+    else:
+        target_client_id = random.choice(list(browser_clients.keys()))
+
+    request_owner_client[request_id] = target_client_id
+
     try:
         # 1. 转换请求，传入可能存在的模式覆盖信息
         lmarena_payload = convert_openai_to_lmarena_payload(
@@ -972,8 +1041,8 @@ async def chat_completions(request: Request):
         }
         
         # 3. 通过 WebSocket 发送
-        logger.info(f"API CALL [ID: {request_id[:8]}]: 正在通过 WebSocket 发送载荷到油猴脚本。")
-        await browser_ws.send_text(json.dumps(message_to_browser))
+        logger.info(f"API CALL [ID: {request_id[:8]}]: 正在通过 WebSocket 发送载荷到客户端 {target_client_id[:8]}。")
+        await browser_clients[target_client_id]['ws'].send_text(json.dumps(message_to_browser))
 
         # 4. 根据 stream 参数决定返回类型
         is_stream = openai_req.get("stream", True)
@@ -991,6 +1060,8 @@ async def chat_completions(request: Request):
         # 如果在设置过程中出错，清理通道
         if request_id in response_channels:
             del response_channels[request_id]
+        if request_id in request_owner_client:
+            del request_owner_client[request_id]
         logger.error(f"API CALL [ID: {request_id[:8]}]: 处理请求时发生致命错误: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -1004,31 +1075,247 @@ async def images_generations(request: Request):
     last_activity_time = datetime.now()
     logger.info(f"文生图 API 请求已收到，活动时间已更新为: {last_activity_time.strftime('%Y-%m-%d %H:%M:%S')}")
     
+    if not browser_clients:
+        return JSONResponse(content={"error": "Browser client not connected."}, status_code=503)
+
+    # 选择一个客户端处理该请求
+    target_client_id = random.choice(list(browser_clients.keys()))
+    
     # 模块已经通过 `initialize_image_module` 初始化，可以直接调用
-    response_data, status_code = await image_generation.handle_image_generation_request(request, browser_ws)
+    response_data, status_code = await image_generation.handle_image_generation_request(request, browser_clients[target_client_id]['ws'])
     
     return JSONResponse(content=response_data, status_code=status_code)
 
 # --- 内部通信端点 ---
 @app.post("/internal/start_id_capture")
-async def start_id_capture():
+async def start_id_capture(request: Request):
     """
-    接收来自 id_updater.py 的通知，并通过 WebSocket 指令
+    接收来自 id_updater.py 或仪表盘的通知，并通过 WebSocket 指令
     激活油猴脚本的 ID 捕获模式。
+    可选请求体: {"client_id": "..."}
     """
-    if not browser_ws:
+    if not browser_clients:
         logger.warning("ID CAPTURE: 收到激活请求，但没有浏览器连接。")
         raise HTTPException(status_code=503, detail="Browser client not connected.")
     
+    preferred_client_id = None
     try:
-        logger.info("ID CAPTURE: 收到激活请求，正在通过 WebSocket 发送指令...")
-        await browser_ws.send_text(json.dumps({"command": "activate_id_capture"}))
+        body = await request.json()
+        preferred_client_id = body.get("client_id") if isinstance(body, dict) else None
+    except Exception:
+        preferred_client_id = None
+    
+    target_ids = []
+    if preferred_client_id and preferred_client_id in browser_clients:
+        target_ids = [preferred_client_id]
+    else:
+        # 兼容旧行为：未指定时广播
+        target_ids = list(browser_clients.keys())
+    
+    try:
+        for cid in target_ids:
+            logger.info(f"ID CAPTURE: 收到激活请求，正在向客户端 {cid[:8]} 发送指令...")
+            await browser_clients[cid]['ws'].send_text(json.dumps({"command": "activate_id_capture"}))
         logger.info("ID CAPTURE: 激活指令已成功发送。")
-        return JSONResponse({"status": "success", "message": "Activation command sent."})
+        return JSONResponse({"status": "success", "message": "Activation command sent.", "targets": target_ids})
     except Exception as e:
         logger.error(f"ID CAPTURE: 发送激活指令时出错: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Failed to send command via WebSocket.")
 
+@app.post("/internal/update_session_ids")
+async def update_session_ids(request: Request):
+    """接收来自浏览器脚本捕获的 sessionId/messageId 并更新配置或映射。"""
+    try:
+        body = await request.json()
+    except json.JSONDecodeError:
+        return JSONResponse(status_code=400, content={"status": "error", "message": "Invalid JSON"})
+
+    session_id = body.get("sessionId") or body.get("session_id")
+    message_id = body.get("messageId") or body.get("message_id")
+    model = body.get("model")
+    mode = body.get("mode")
+    battle_target = body.get("battle_target") or body.get("target")
+    client_id = body.get("clientId") or body.get("client_id")
+
+    if not session_id or not message_id:
+        return JSONResponse(status_code=400, content={"status": "error", "message": "Missing sessionId or messageId"})
+
+    if model:
+        # 追加到模型映射中
+        current = MODEL_ENDPOINT_MAP.get(model)
+        new_entry = {"session_id": session_id, "message_id": message_id}
+        if mode:
+            new_entry["mode"] = mode
+        if battle_target:
+            new_entry["battle_target"] = battle_target
+        if client_id:
+            new_entry["client_id"] = client_id
+        
+        if not current:
+            MODEL_ENDPOINT_MAP[model] = [new_entry]
+        elif isinstance(current, dict):
+            MODEL_ENDPOINT_MAP[model] = [current, new_entry]
+        elif isinstance(current, list):
+            MODEL_ENDPOINT_MAP[model].append(new_entry)
+        else:
+            MODEL_ENDPOINT_MAP[model] = [new_entry]
+        save_model_endpoint_map()
+        return JSONResponse({"status": "success", "message": "Mapping updated", "model": model})
+    else:
+        # 更新全局默认配置
+        CONFIG["session_id"] = session_id
+        CONFIG["message_id"] = message_id
+        save_config()
+        return JSONResponse({"status": "success", "message": "Default session updated"})
+
+# --- 仪表盘端点 ---
+@app.get("/dashboard")
+async def dashboard_page():
+    html = """
+    <!doctype html>
+    <html>
+    <head>
+      <meta charset=\"utf-8\" />
+      <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\" />
+      <title>LMArena Bridge - Session Dashboard</title>
+      <style>
+        body { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; margin: 20px; }
+        h2 { margin-top: 28px; }
+        table { border-collapse: collapse; width: 100%; }
+        th, td { border: 1px solid #ddd; padding: 8px; font-size: 14px; }
+        th { background: #f6f6f6; text-align: left; }
+        input, select { padding: 6px 8px; font-size: 14px; }
+        button { padding: 6px 10px; margin: 4px 0; }
+        .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+        .badge { display: inline-block; padding: 2px 6px; background: #eef; border: 1px solid #ccd; border-radius: 4px; font-size: 12px; }
+        .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+      </style>
+    </head>
+    <body>
+      <h1>LMArena Bridge - Session Dashboard</h1>
+
+      <h2>Connected Clients</h2>
+      <div id=\"clients\"></div>
+
+      <h2>Model Endpoint Map</h2>
+      <div class=\"row\">
+        <input id=\"model\" placeholder=\"model name (as in models.json)\" size=\"36\" />
+        <input id=\"sid\" placeholder=\"session_id\" size=\"36\" />
+        <input id=\"mid\" placeholder=\"message_id\" size=\"36\" />
+        <select id=\"mode\">
+          <option value=\"\">(mode optional)</option>
+          <option value=\"direct_chat\">direct_chat</option>
+          <option value=\"battle\">battle</option>
+        </select>
+        <select id=\"target\">
+          <option value=\"\">(target)</option>
+          <option value=\"A\">A</option>
+          <option value=\"B\">B</option>
+        </select>
+        <input id=\"client\" placeholder=\"client_id (optional)\" size=\"36\" />
+        <button onclick=\"addEntry()\">Add</button>
+        <button onclick=\"saveMap()\">Save All</button>
+      </div>
+      <pre id=\"map\" class=\"mono\" style=\"white-space: pre-wrap; background:#fafafa; padding:10px; border:1px solid #eee;\"></pre>
+
+      <script>
+      async function fetchClients(){
+        const res = await fetch('/dashboard/api/clients');
+        const data = await res.json();
+        const root = document.getElementById('clients');
+        if(!Array.isArray(data) || data.length===0){ root.innerHTML = '<p>No clients connected.</p>'; return; }
+        let html = '<table><thead><tr><th>Client ID</th><th>Title</th><th>URL</th><th>Last Seen</th><th>Actions</th></tr></thead><tbody>';
+        for(const c of data){
+          html += `<tr><td class=\"mono\">${c.client_id}</td><td>${c.title||''}</td><td class=\"mono\">${c.url||''}</td><td>${c.last_seen}</td>`+
+                  `<td><button onclick=\"activate('${c.client_id}')\">Activate ID Capture</button></td></tr>`;
+        }
+        html += '</tbody></table>';
+        root.innerHTML = html;
+      }
+      async function activate(cid){
+        await fetch('/dashboard/api/start_id_capture', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({client_id:cid})});
+        alert('Capture activated on '+cid+' (click Retry in that tab).');
+      }
+      let MAP = {};
+      async function fetchMap(){
+        const res = await fetch('/dashboard/api/model-endpoints');
+        MAP = await res.json();
+        document.getElementById('map').textContent = JSON.stringify(MAP, null, 2);
+      }
+      function addEntry(){
+        const model = document.getElementById('model').value.trim();
+        const sid = document.getElementById('sid').value.trim();
+        const mid = document.getElementById('mid').value.trim();
+        const mode = document.getElementById('mode').value;
+        const target = document.getElementById('target').value;
+        const client = document.getElementById('client').value.trim();
+        if(!model||!sid||!mid){ alert('model/session_id/message_id are required'); return; }
+        const entry = { session_id: sid, message_id: mid};
+        if(mode) entry.mode = mode;
+        if(target) entry.battle_target = target;
+        if(client) entry.client_id = client;
+        if(!MAP[model]) MAP[model] = [];
+        if(!Array.isArray(MAP[model])) MAP[model] = [MAP[model]];
+        MAP[model].push(entry);
+        document.getElementById('map').textContent = JSON.stringify(MAP, null, 2);
+      }
+      async function saveMap(){
+        await fetch('/dashboard/api/model-endpoints', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(MAP)});
+        alert('Saved');
+      }
+      fetchClients();
+      fetchMap();
+      setInterval(fetchClients, 5000);
+      </script>
+    </body>
+    </html>
+    """
+    return HTMLResponse(content=html)
+
+@app.get("/dashboard/api/clients")
+async def list_clients():
+    items = []
+    for cid, info in browser_clients.items():
+        meta = info.get('meta', {})
+        items.append({
+            "client_id": cid,
+            "title": meta.get('title'),
+            "url": meta.get('url'),
+            "last_seen": info.get('last_seen').strftime('%Y-%m-%d %H:%M:%S') if info.get('last_seen') else None,
+        })
+    return items
+
+@app.get("/dashboard/api/model-endpoints")
+async def get_model_endpoint_map():
+    return MODEL_ENDPOINT_MAP
+
+@app.post("/dashboard/api/model-endpoints")
+async def replace_model_endpoint_map(request: Request):
+    try:
+        new_map = await request.json()
+        if not isinstance(new_map, dict):
+            raise ValueError("Body must be a JSON object")
+        # 简单校验结构
+        for k, v in new_map.items():
+            if not (isinstance(v, (dict, list))):
+                raise ValueError("Each model entry must be an object or array")
+        global MODEL_ENDPOINT_MAP
+        MODEL_ENDPOINT_MAP = new_map
+        save_model_endpoint_map()
+        return {"status": "success"}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.post("/dashboard/api/start_id_capture")
+async def dashboard_start_capture(request: Request):
+    body = await request.json()
+    client_id = body.get("client_id") if isinstance(body, dict) else None
+    if not client_id:
+        raise HTTPException(status_code=400, detail="client_id is required")
+    if client_id not in browser_clients:
+        raise HTTPException(status_code=404, detail="client not found")
+    await browser_clients[client_id]['ws'].send_text(json.dumps({"command": "activate_id_capture"}))
+    return {"status": "ok"}
 
 # --- 主程序入口 ---
 if __name__ == "__main__":
@@ -1037,5 +1324,6 @@ if __name__ == "__main__":
     logger.info(f"🚀 LMArena Bridge v2.0 API 服务器正在启动...")
     logger.info(f"   - 监听地址: http://127.0.0.1:{api_port}")
     logger.info(f"   - WebSocket 端点: ws://127.0.0.1:{api_port}/ws")
+    logger.info(f"   - 仪表盘地址: http://127.0.0.1:{api_port}/dashboard")
     
     uvicorn.run(app, host="0.0.0.0", port=api_port)
