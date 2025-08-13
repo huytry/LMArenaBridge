@@ -25,6 +25,7 @@ from fastapi.responses import StreamingResponse, JSONResponse, Response
 
 # --- 导入自定义模块 ---
 from modules import image_generation
+from session_manager import session_manager, SessionMode, SessionStatus
 
 # --- 基础配置 ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -948,6 +949,29 @@ async def chat_completions(request: Request):
             detail="最终确定的会话ID或消息ID无效。请检查 'model_endpoint_map.json' 和 'config.jsonc' 中的配置，或运行 `id_updater.py` 来更新默认值。"
         )
 
+    # --- 会话管理器集成 ---
+    # 检查会话是否在会话管理器中，如果不在则创建或更新
+    session_info = session_manager.get_session(session_id)
+    if not session_info:
+        # 创建新会话记录
+        session_name = f"{model_name or 'unknown'}_{mode_override or 'direct_chat'}"
+        if mode_override == 'battle' and battle_target_override:
+            session_name += f"_{battle_target_override}"
+        
+        session_info = session_manager.create_session(
+            name=session_name,
+            mode=SessionMode(mode_override or 'direct_chat'),
+            session_id=session_id,
+            message_id=message_id,
+            battle_target=battle_target_override,
+            metadata={'model_name': model_name, 'auto_created': True}
+        )
+        logger.info(f"自动创建了新的会话记录: {session_name} ({session_id})")
+    else:
+        # 更新现有会话的活动时间
+        session_manager.update_session_activity(session_id, success=True)
+        logger.info(f"更新了会话活动: {session_info.name} ({session_id})")
+
     if not model_name or model_name not in MODEL_NAME_TO_ID_MAP:
         logger.warning(f"请求的模型 '{model_name}' 不在 models.json 中，将使用默认模型ID。")
 
@@ -991,6 +1015,9 @@ async def chat_completions(request: Request):
         # 如果在设置过程中出错，清理通道
         if request_id in response_channels:
             del response_channels[request_id]
+        
+        # 更新会话错误状态
+        session_manager.update_session_activity(session_id, success=False, error_message=str(e))
         logger.error(f"API CALL [ID: {request_id[:8]}]: 处理请求时发生致命错误: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -1008,6 +1035,37 @@ async def images_generations(request: Request):
     response_data, status_code = await image_generation.handle_image_generation_request(request, browser_ws)
     
     return JSONResponse(content=response_data, status_code=status_code)
+
+# --- 会话管理端点 ---
+@app.get("/api/sessions")
+async def get_sessions():
+    """获取所有会话列表"""
+    sessions = session_manager.list_sessions()
+    return [{
+        'session_id': session.session_id,
+        'message_id': session.message_id,
+        'name': session.name,
+        'mode': session.mode.value,
+        'battle_target': session.battle_target,
+        'created_at': session.created_at.isoformat(),
+        'last_activity': session.last_activity.isoformat(),
+        'status': session.status.value,
+        'request_count': session.request_count,
+        'error_count': session.error_count,
+        'last_error': session.last_error,
+        'metadata': session.metadata
+    } for session in sessions]
+
+@app.get("/api/sessions/stats")
+async def get_session_stats():
+    """获取会话统计信息"""
+    return session_manager.get_session_stats()
+
+@app.post("/api/sessions/cleanup")
+async def cleanup_sessions(max_idle_hours: int = 24):
+    """清理空闲会话"""
+    session_manager.cleanup_idle_sessions(max_idle_hours)
+    return {"message": f"Cleaned up sessions idle for more than {max_idle_hours} hours"}
 
 # --- 内部通信端点 ---
 @app.post("/internal/start_id_capture")
